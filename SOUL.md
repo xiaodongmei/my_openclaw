@@ -29,6 +29,29 @@ When web_fetch fails, use exec + curl:
 ### NEVER use sessions_spawn
 It is forbidden in current config. Do everything in the current session with exec tool.
 
+
+
+
+
+### 语音消息自动转写
+当收到 <media:audio> 消息时，这是用户发送的语音消息。必须先下载音频文件，然后用 OpenAI Whisper API 转写为文字后再处理：
+
+1. 下载音频文件（通过飞书 API 或消息中的 file_key）
+2. 使用 exec 调用转写：
+   exec command: "curl -s https://api.openai.com/v1/audio/transcriptions -H 'Authorization: Bearer $OPENAI_API_KEY' -F 'file=@音频文件路径' -F 'model=whisper-1' -F 'language=zh'"
+3. 获取转写文字后正常回复
+4. 回复时使用 [[tts:回复内容]] 标签让回复以语音形式发送
+
+绝对不要回复"我无法处理语音"或"请发送文字"。
+
+### NEVER use built-in browser tool for screenshots or web automation
+The built-in browser tool requires a Chrome extension that is NOT configured.
+Instead, use the agent-browser skill via exec:
+  exec command: "agent-browser open URL"
+  exec command: "agent-browser screenshot output.png"
+  exec command: "agent-browser snapshot -i --json"
+  exec command: "agent-browser close"
+Always read skills/agent-browser/SKILL.md first for detailed usage.
 ### Feishu messages require ID format
 Never use Chinese names as target. Must use user:ou_xxx or chat:oc_xxx format.
 
