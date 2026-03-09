@@ -1,0 +1,613 @@
+#!/usr/bin/env python3
+"""
+微信公众号操作客户端
+通过 agent-browser 实现微信公众号后台自动化操作：
+- 登录（扫码）
+- 查看文章列表和数据（点赞、阅读等）
+- 发布文章（草稿）
+- 获取账号信息
+
+使用方法:
+  python3 wechat_mp_client.py login          # 登录（获取二维码）
+  python3 wechat_mp_client.py status         # 检查登录状态
+  python3 wechat_mp_client.py articles       # 获取文章列表
+  python3 wechat_mp_client.py article_stats  # 获取最新文章数据
+  python3 wechat_mp_client.py draft '{"title":"标题","content":"内容"}'
+  python3 wechat_mp_client.py publish '{"title":"标题","content":"内容"}'
+  python3 wechat_mp_client.py publish_confirm
+  python3 wechat_mp_client.py account_info   # 获取账号信息
+"""
+
+import subprocess
+import json
+import sys
+import os
+import time
+import urllib.request
+import urllib.parse
+
+# 配置
+MP_URL = "https://mp.weixin.qq.com"
+SESSION_NAME = "wechat-mp"
+STATE_FILE = os.path.expanduser("~/.openclaw/workspace/data/wechat-mp-state.json")
+QR_SCREENSHOT = os.path.expanduser("~/.openclaw/workspace/data/wechat-mp-qr.png")
+
+# 飞书配置（用于直接发送图片消息）
+FEISHU_APP_ID = "cli_a92abc6e2e395cc6"
+FEISHU_APP_SECRET = "y2JmtAkrcsCVHn1wRKaWfbQ8vCeo0WJX"
+FEISHU_USER_OPEN_ID = "ou_2a8de8097294e557f1d8ca5d08e91c63"
+
+# 确保 data 目录存在
+os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+
+
+def upload_to_imghost(filepath):
+    """上传图片到免费图床，返回可访问的URL（纯stdlib实现）"""
+    try:
+        import uuid
+        boundary = uuid.uuid4().hex
+        with open(filepath, "rb") as f:
+            file_data = f.read()
+        body = (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="reqtype"\r\n\r\nfileupload\r\n'
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="fileToUpload"; filename="qr.png"\r\n'
+            f"Content-Type: image/png\r\n\r\n"
+        ).encode() + file_data + f"\r\n--{boundary}--\r\n".encode()
+        req = urllib.request.Request(
+            "https://catbox.moe/user/api.php",
+            data=body,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = resp.read().decode().strip()
+            if result.startswith("http"):
+                return result
+    except Exception:
+        pass
+    return None
+
+
+def send_feishu_image(filepath):
+    """尝试通过飞书API直接发送图片给用户（纯stdlib实现）"""
+    try:
+        import uuid
+        # 获取token
+        token_data = json.dumps({"app_id": FEISHU_APP_ID, "app_secret": FEISHU_APP_SECRET}).encode()
+        token_req = urllib.request.Request(
+            "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+            data=token_data,
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        with urllib.request.urlopen(token_req, timeout=10) as resp:
+            token_resp = json.loads(resp.read())
+        token = token_resp.get("tenant_access_token", "")
+        if not token:
+            return False
+
+        # 上传图片 (multipart)
+        boundary = uuid.uuid4().hex
+        with open(filepath, "rb") as f:
+            file_data = f.read()
+        body = (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="image_type"\r\n\r\nmessage\r\n'
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="image"; filename="qr.png"\r\n'
+            f"Content-Type: image/png\r\n\r\n"
+        ).encode() + file_data + f"\r\n--{boundary}--\r\n".encode()
+        upload_req = urllib.request.Request(
+            "https://open.feishu.cn/open-apis/im/v1/images",
+            data=body,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": f"multipart/form-data; boundary={boundary}"
+            },
+            method="POST"
+        )
+        with urllib.request.urlopen(upload_req, timeout=15) as resp:
+            upload_data = json.loads(resp.read())
+        if upload_data.get("code") != 0:
+            return False
+        image_key = upload_data["data"]["image_key"]
+
+        # 发送图片消息
+        send_data = json.dumps({
+            "receive_id": FEISHU_USER_OPEN_ID,
+            "msg_type": "image",
+            "content": json.dumps({"image_key": image_key})
+        }).encode()
+        send_req = urllib.request.Request(
+            "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id",
+            data=send_data,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json"
+            },
+            method="POST"
+        )
+        with urllib.request.urlopen(send_req, timeout=10) as resp:
+            send_resp = json.loads(resp.read())
+        if send_resp.get("code") != 0:
+            return False
+
+        # 图片发送成功后，再发一条文字提示
+        text_data = json.dumps({
+            "receive_id": FEISHU_USER_OPEN_ID,
+            "msg_type": "text",
+            "content": json.dumps({"text": "请用微信扫描上方二维码登录公众号。扫码完成后回复我【已扫码】即可。"})
+        }).encode()
+        text_req = urllib.request.Request(
+            "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id",
+            data=text_data,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json"
+            },
+            method="POST"
+        )
+        try:
+            with urllib.request.urlopen(text_req, timeout=10) as resp:
+                pass
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+
+def run_ab(cmd_args, timeout=30):
+    """执行 agent-browser 命令"""
+    full_cmd = f"agent-browser --session {SESSION_NAME} {cmd_args}"
+    try:
+        result = subprocess.run(
+            full_cmd, shell=True, capture_output=True, text=True, timeout=timeout
+        )
+        output = result.stdout.strip()
+        if result.returncode != 0 and result.stderr.strip():
+            return {"success": False, "error": result.stderr.strip()}
+        try:
+            return json.loads(output)
+        except json.JSONDecodeError:
+            return {"success": True, "data": output}
+    except subprocess.TimeoutExpired:
+        return {"success": False, "error": "命令超时"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def check_status():
+    """检查当前登录状态"""
+    if os.path.exists(STATE_FILE):
+        result = run_ab(f"state load {STATE_FILE}")
+        if result.get("success"):
+            run_ab(f"open {MP_URL}", timeout=15)
+            time.sleep(3)
+            run_ab("wait --load networkidle", timeout=15)
+
+            url_result = run_ab("get url --json")
+            current_url = ""
+            if isinstance(url_result, dict) and url_result.get("success"):
+                current_url = str(url_result.get("data", ""))
+
+            if "login" in current_url.lower() or "scanlogin" in current_url.lower():
+                print(json.dumps({"status": "not_logged_in", "message": "登录已过期，请重新登录"}, ensure_ascii=False))
+                return
+
+            snap = run_ab("snapshot -i --json")
+            snap_str = json.dumps(snap, ensure_ascii=False) if isinstance(snap, dict) else str(snap)
+
+            if any(kw in snap_str for kw in ["首页", "图文消息", "创作", "内容管理", "发表"]):
+                print(json.dumps({"status": "logged_in", "message": "已登录微信公众号后台"}, ensure_ascii=False))
+                return
+
+    print(json.dumps({"status": "not_logged_in", "message": "未登录，请使用 login 命令登录"}, ensure_ascii=False))
+
+
+def login():
+    """登录微信公众号（获取二维码截图供扫码）"""
+    print(json.dumps({"step": "opening", "message": "正在打开微信公众号登录页..."}, ensure_ascii=False), flush=True)
+
+    run_ab(f"open {MP_URL}", timeout=20)
+    time.sleep(4)
+    run_ab("wait --load networkidle", timeout=15)
+
+    url_result = run_ab("get url --json")
+    current_url = ""
+    if isinstance(url_result, dict) and url_result.get("success"):
+        current_url = str(url_result.get("data", ""))
+
+    snap = run_ab("snapshot -i --json")
+    snap_str = json.dumps(snap, ensure_ascii=False) if isinstance(snap, dict) else str(snap)
+
+    if any(kw in snap_str for kw in ["首页", "图文消息", "创作", "内容管理"]):
+        run_ab(f"state save {STATE_FILE}")
+        print(json.dumps({"status": "already_logged_in", "message": "已经处于登录状态！"}, ensure_ascii=False))
+        return
+
+    # 截取二维码截图
+    run_ab(f"screenshot {QR_SCREENSHOT}", timeout=10)
+
+    # 尝试通过飞书API直接发送图片
+    feishu_sent = send_feishu_image(QR_SCREENSHOT)
+
+    if feishu_sent:
+        print(json.dumps({
+            "status": "waiting_scan",
+            "message": "二维码已通过飞书发送！请用微信扫码登录。扫码完成后告诉我。",
+            "feishu_image_sent": True
+        }, ensure_ascii=False))
+        return
+
+    # 飞书API发送失败（权限不足），上传到图床
+    qr_url = upload_to_imghost(QR_SCREENSHOT)
+
+    if qr_url:
+        print(json.dumps({
+            "status": "waiting_scan",
+            "message": "请使用微信扫描二维码登录公众号",
+            "qr_url": qr_url,
+            "instruction": "请打开上面的链接查看二维码并用微信扫码。扫码完成后告诉我。"
+        }, ensure_ascii=False))
+    else:
+        print(json.dumps({
+            "status": "waiting_scan",
+            "message": "请使用微信扫描二维码登录",
+            "qr_screenshot": QR_SCREENSHOT,
+            "instruction": "二维码截图已保存到本地，请用微信App扫码。扫码完成后告诉我。"
+        }, ensure_ascii=False))
+
+
+def login_confirm():
+    """确认登录完成（扫码后调用）"""
+    print(json.dumps({"step": "confirming", "message": "正在确认登录状态..."}, ensure_ascii=False), flush=True)
+
+    max_wait = 90
+    interval = 5
+    waited = 0
+
+    while waited < max_wait:
+        url_result = run_ab("get url --json")
+        current_url = ""
+        if isinstance(url_result, dict) and url_result.get("success"):
+            current_url = str(url_result.get("data", ""))
+
+        snap = run_ab("snapshot -i --json")
+        snap_str = json.dumps(snap, ensure_ascii=False) if isinstance(snap, dict) else str(snap)
+
+        if any(kw in snap_str for kw in ["首页", "图文消息", "创作", "内容管理", "发表"]):
+            run_ab(f"state save {STATE_FILE}")
+            print(json.dumps({"status": "logged_in", "message": "登录成功！状态已保存。"}, ensure_ascii=False))
+            return
+
+        if "login" not in current_url.lower() and "scan" not in current_url.lower() and current_url:
+            time.sleep(3)
+            run_ab(f"state save {STATE_FILE}")
+            print(json.dumps({"status": "logged_in", "message": "登录成功！状态已保存。"}, ensure_ascii=False))
+            return
+
+        time.sleep(interval)
+        waited += interval
+        print(json.dumps({"step": "waiting", "message": f"等待扫码...({waited}/{max_wait}秒)"}, ensure_ascii=False), flush=True)
+
+    print(json.dumps({"status": "timeout", "message": "等待扫码超时，请重新登录"}, ensure_ascii=False))
+
+
+def get_articles():
+    """获取文章列表"""
+    _ensure_logged_in()
+
+    run_ab(f"open {MP_URL}/cgi-bin/appmsgpublish?sub=list&begin=0&count=10", timeout=15)
+    time.sleep(3)
+    run_ab("wait --load networkidle", timeout=15)
+
+    snap = run_ab("snapshot -i --json")
+    snap_str = json.dumps(snap, ensure_ascii=False) if isinstance(snap, dict) else str(snap)
+
+    articles_screenshot = os.path.expanduser("~/.openclaw/workspace/data/wechat-mp-articles.png")
+    run_ab(f"screenshot --full {articles_screenshot}", timeout=10)
+
+    print(json.dumps({
+        "status": "success",
+        "message": "已获取文章列表页面",
+        "snapshot": snap_str[:5000],
+        "screenshot": articles_screenshot
+    }, ensure_ascii=False))
+
+
+def get_article_stats():
+    """获取最新文章的数据统计（阅读、点赞等）"""
+    _ensure_logged_in()
+
+    run_ab(f"open {MP_URL}/cgi-bin/appmsganalysis?sub=list", timeout=15)
+    time.sleep(3)
+    run_ab("wait --load networkidle", timeout=15)
+
+    snap = run_ab("snapshot -i --json")
+    snap_str = json.dumps(snap, ensure_ascii=False) if isinstance(snap, dict) else str(snap)
+
+    stats_screenshot = os.path.expanduser("~/.openclaw/workspace/data/wechat-mp-stats.png")
+    run_ab(f"screenshot --full {stats_screenshot}", timeout=10)
+
+    print(json.dumps({
+        "status": "success",
+        "message": "已获取文章统计数据",
+        "snapshot": snap_str[:5000],
+        "screenshot": stats_screenshot
+    }, ensure_ascii=False))
+
+
+def create_draft(params_json):
+    """创建文章草稿"""
+    _ensure_logged_in()
+
+    try:
+        params = json.loads(params_json)
+    except json.JSONDecodeError:
+        print(json.dumps({"status": "error", "message": "参数格式错误，需要JSON格式"}, ensure_ascii=False))
+        return
+
+    title = params.get("title", "")
+    content = params.get("content", "")
+
+    if not title or not content:
+        print(json.dumps({"status": "error", "message": "标题和内容不能为空"}, ensure_ascii=False))
+        return
+
+    run_ab(f"open {MP_URL}/cgi-bin/appmsg?t=media/appmsg_edit&action=edit&type=77", timeout=20)
+    time.sleep(4)
+    run_ab("wait --load networkidle", timeout=15)
+
+    snap = run_ab("snapshot -i --json")
+    refs = _extract_refs(snap)
+
+    # 填写标题
+    for ref_id, ref_info in refs.items():
+        ref_str = json.dumps(ref_info, ensure_ascii=False).lower()
+        if "标题" in ref_str or "title" in ref_str:
+            run_ab(f'fill @{ref_id} "{title}"')
+            break
+
+    time.sleep(1)
+
+    # 尝试点击正文区域并输入
+    for ref_id, ref_info in refs.items():
+        ref_role = str(ref_info.get("role", ""))
+        ref_str = json.dumps(ref_info, ensure_ascii=False).lower()
+        if "正文" in ref_str or ref_role in ["textbox", "document"]:
+            run_ab(f"click @{ref_id}")
+            time.sleep(0.5)
+            run_ab(f'type @{ref_id} "{content}"')
+            break
+
+    time.sleep(1)
+
+    draft_screenshot = os.path.expanduser("~/.openclaw/workspace/data/wechat-mp-draft.png")
+    run_ab(f"screenshot --full {draft_screenshot}", timeout=10)
+
+    print(json.dumps({
+        "status": "draft_created",
+        "message": f"草稿已创建，标题: {title}",
+        "screenshot": draft_screenshot,
+        "next_steps": "使用 publish_confirm 命令点击发布按钮"
+    }, ensure_ascii=False))
+
+
+def publish_article(params_json):
+    """通过微信公众号后台发布文章"""
+    _ensure_logged_in()
+
+    try:
+        params = json.loads(params_json)
+    except json.JSONDecodeError:
+        print(json.dumps({"status": "error", "message": "参数格式错误，需要JSON格式"}, ensure_ascii=False))
+        return
+
+    title = params.get("title", "")
+    content = params.get("content", "")
+    author = params.get("author", "")
+
+    if not title or not content:
+        print(json.dumps({"status": "error", "message": "标题和内容不能为空"}, ensure_ascii=False))
+        return
+
+    print(json.dumps({"step": 1, "message": "正在打开文章编辑器..."}, ensure_ascii=False), flush=True)
+    run_ab(f"open {MP_URL}/cgi-bin/appmsg?t=media/appmsg_edit&action=edit&type=77", timeout=20)
+    time.sleep(5)
+    run_ab("wait --load networkidle", timeout=15)
+
+    snap = run_ab("snapshot -i --json")
+    refs = _extract_refs(snap)
+
+    # 填写标题
+    print(json.dumps({"step": 2, "message": f"正在填写标题: {title}"}, ensure_ascii=False), flush=True)
+    title_filled = False
+    for ref_id, ref_info in refs.items():
+        ref_str = json.dumps(ref_info, ensure_ascii=False).lower()
+        if "标题" in ref_str or "title" in ref_str:
+            run_ab(f'fill @{ref_id} "{title}"')
+            title_filled = True
+            break
+    time.sleep(1)
+
+    # 填写作者（如果有）
+    if author:
+        for ref_id, ref_info in refs.items():
+            ref_str = json.dumps(ref_info, ensure_ascii=False).lower()
+            if "作者" in ref_str or "author" in ref_str:
+                run_ab(f'fill @{ref_id} "{author}"')
+                break
+        time.sleep(0.5)
+
+    # 填写正文
+    print(json.dumps({"step": 3, "message": "正在填写正文内容..."}, ensure_ascii=False), flush=True)
+    for ref_id, ref_info in refs.items():
+        ref_role = str(ref_info.get("role", ""))
+        ref_str = json.dumps(ref_info, ensure_ascii=False).lower()
+        if "正文" in ref_str or "编辑" in ref_str or ref_role in ["textbox", "document"]:
+            run_ab(f"click @{ref_id}")
+            time.sleep(0.5)
+            # 分段输入长内容
+            paragraphs = content.split("\\n")
+            for p in paragraphs:
+                if p.strip():
+                    run_ab(f'type @{ref_id} "{p.strip()}"')
+                    run_ab('press Enter')
+                    time.sleep(0.3)
+            break
+    time.sleep(1)
+
+    draft_screenshot = os.path.expanduser("~/.openclaw/workspace/data/wechat-mp-publish-draft.png")
+    run_ab(f"screenshot --full {draft_screenshot}", timeout=10)
+    run_ab(f"state save {STATE_FILE}")
+
+    print(json.dumps({
+        "status": "draft_ready",
+        "message": f"文章草稿已准备好。标题: {title}",
+        "screenshot": draft_screenshot,
+        "next_steps": "确认内容无误后，使用 publish_confirm 命令发布"
+    }, ensure_ascii=False))
+
+
+def publish_confirm():
+    """确认发布（点击发布/群发按钮）"""
+    _ensure_logged_in()
+
+    snap = run_ab("snapshot -i --json")
+    refs = _extract_refs(snap)
+
+    for ref_id, ref_info in refs.items():
+        ref_str = json.dumps(ref_info, ensure_ascii=False)
+        if any(kw in ref_str for kw in ["群发", "发布", "发送", "保存并群发"]):
+            run_ab(f"click @{ref_id}")
+            time.sleep(3)
+
+            # 处理确认弹窗
+            snap2 = run_ab("snapshot -i --json")
+            refs2 = _extract_refs(snap2)
+            for ref_id2, ref_info2 in refs2.items():
+                ref_str2 = json.dumps(ref_info2, ensure_ascii=False)
+                if "确定" in ref_str2 or "确认" in ref_str2 or "发送" in ref_str2:
+                    run_ab(f"click @{ref_id2}")
+                    break
+
+            time.sleep(3)
+            confirm_screenshot = os.path.expanduser("~/.openclaw/workspace/data/wechat-mp-published.png")
+            run_ab(f"screenshot {confirm_screenshot}", timeout=10)
+
+            print(json.dumps({
+                "status": "published",
+                "message": "文章已发布！",
+                "screenshot": confirm_screenshot
+            }, ensure_ascii=False))
+            return
+
+    print(json.dumps({"status": "error", "message": "未找到发布按钮，请截图查看当前页面状态"}, ensure_ascii=False))
+
+
+def get_account_info():
+    """获取公众号账号信息"""
+    _ensure_logged_in()
+
+    run_ab(f"open {MP_URL}/cgi-bin/settingpage?t=setting/index", timeout=15)
+    time.sleep(3)
+    run_ab("wait --load networkidle", timeout=15)
+
+    snap = run_ab("snapshot -i --json")
+    snap_str = json.dumps(snap, ensure_ascii=False) if isinstance(snap, dict) else str(snap)
+
+    info_screenshot = os.path.expanduser("~/.openclaw/workspace/data/wechat-mp-account.png")
+    run_ab(f"screenshot --full {info_screenshot}", timeout=10)
+
+    print(json.dumps({
+        "status": "success",
+        "message": "已获取账号信息",
+        "snapshot": snap_str[:5000],
+        "screenshot": info_screenshot
+    }, ensure_ascii=False))
+
+
+def _extract_refs(snap):
+    """从snapshot中提取refs"""
+    refs = {}
+    if isinstance(snap, dict):
+        data = snap.get("data", snap)
+        if isinstance(data, dict):
+            refs = data.get("refs", {})
+    return refs
+
+
+def _ensure_logged_in():
+    """确保已登录"""
+    if os.path.exists(STATE_FILE):
+        result = run_ab(f"state load {STATE_FILE}")
+        if result.get("success"):
+            return True
+
+    run_ab(f"open {MP_URL}", timeout=15)
+    time.sleep(3)
+    run_ab("wait --load networkidle", timeout=10)
+
+    url_result = run_ab("get url --json")
+    current_url = str(url_result.get("data", "")) if isinstance(url_result, dict) else ""
+
+    if "login" in current_url.lower() or "scanlogin" in current_url.lower():
+        print(json.dumps({
+            "status": "not_logged_in",
+            "message": "未登录，请先使用 login 命令登录"
+        }, ensure_ascii=False))
+        sys.exit(1)
+
+    return True
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(json.dumps({
+            "usage": {
+                "login": "登录微信公众号（获取二维码截图）",
+                "login_confirm": "确认扫码登录（扫码后调用）",
+                "status": "检查登录状态",
+                "articles": "获取文章列表",
+                "article_stats": "获取最新文章数据统计",
+                "draft": "创建文章草稿 (需JSON参数: title, content)",
+                "publish": "发布文章 (需JSON参数: title, content, author)",
+                "publish_confirm": "确认发布已编辑好的文章",
+                "account_info": "获取账号信息"
+            }
+        }, ensure_ascii=False, indent=2))
+        return
+
+    command = sys.argv[1]
+
+    commands = {
+        "login": login,
+        "login_confirm": login_confirm,
+        "status": check_status,
+        "articles": get_articles,
+        "article_stats": get_article_stats,
+        "account_info": get_account_info,
+        "publish_confirm": publish_confirm,
+    }
+
+    if command in commands:
+        commands[command]()
+    elif command == "draft":
+        if len(sys.argv) < 3:
+            print(json.dumps({"error": "需要JSON参数"}, ensure_ascii=False))
+            return
+        create_draft(sys.argv[2])
+    elif command == "publish":
+        if len(sys.argv) < 3:
+            print(json.dumps({"error": "需要JSON参数"}, ensure_ascii=False))
+            return
+        publish_article(sys.argv[2])
+    else:
+        print(json.dumps({"error": f"未知命令: {command}"}, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()
