@@ -129,3 +129,158 @@ sessions_spawn 在当前配置中被禁止。不要调用它。
 - 微信公众号session有效期较短（约4-6小时），过期后需重新扫码登录
 - 所有操作通过后台API完成（非UI自动化），稳定可靠
 - 禁止回复"我无法直接发布文章"或"请提供API"，必须执行上述命令
+
+
+### 10. AI生图 - 香蕉Pro（NanoBanana）⚠️必读
+
+**触发词：画图、生图、画一张、生成图片、AI生图、制作封面、生成壁纸、画一下**
+
+收到以上请求，立即执行下方脚本，禁止回复"我无法生图"或推荐外部网站，禁止自己拼dvcode命令。
+
+#### 执行方式（唯一正确方式）
+
+把用户的提示词填入脚本第一个参数：
+
+  exec command: "python3 ~/.openclaw/skills/dvcode-image/dvcode_image.py auto 可爱橘猫坐在窗边" timeout: 120
+
+比例参数说明：
+- auto → 自动（通用）
+- 16:9 → 横图（封面/背景）
+- 9:16 → 竖图（手机壁纸/小红书）
+
+示例：
+  exec command: "python3 ~/.openclaw/skills/dvcode-image/dvcode_image.py auto 可爱橘猫坐在窗边" timeout: 120
+  exec command: "python3 ~/.openclaw/skills/dvcode-image/dvcode_image.py 16:9 赛博朋克城市夜景" timeout: 120
+  exec command: "python3 ~/.openclaw/skills/dvcode-image/dvcode_image.py 9:16 水墨山水" timeout: 120
+
+图生图（带参考图）：
+  exec command: "python3 ~/.openclaw/skills/dvcode-image/dvcode_image.py auto 按这个风格画猫 /绝对路径/参考图.jpg" timeout: 120
+
+#### 规则（严格遵守）
+
+1. 提示词直接作为命令行参数传给脚本，不加引号、不加转义
+2. timeout 必须设 120，不能省略
+3. 命令同步阻塞，等输出完整 JSON 后才回复用户，绝对禁止中途回复"正在进行"
+4. 成功输出：{"success": true, "image_url": "https://...", "local_path": "...", "credits_used": N}
+   → 把 image_url 发给用户，告知保存路径
+5. 失败输出含"配额超限"→ 告知用户稍后重试
+6. 失败输出含"unauthorized"→ 执行登录：exec command: "dvcode --login sk_live_你的APIKey"
+
+#### 禁止行为
+
+- 禁止直接执行 dvcode --output-format stream-json --yolo "/nanobanana ..." 命令
+- 禁止在提示词外面加单引号或双引号
+- 禁止 pty:true 模式运行生图命令
+- 禁止中途回复"正在生成"
+
+### 11. 旅行攻略生成器（xhs-travel-guide）⚠️必读
+
+**触发词**：旅行攻略、旅游计划、制定攻略、规划路线、景点推荐、travel itinerary、plan a trip、帮我制定、帮我规划
+
+收到以上请求，立即按以下完整流程执行，**禁止直接用文字回复攻略内容**。
+
+---
+
+#### 第一步：收集参数
+
+必问：
+- 目的地（城市/地区）
+- 旅行天数
+- 旅行类型（美食/文化/自然/自由行）
+
+可选：预算范围、出行时间
+
+---
+
+#### 第二步：搜索小红书（必须浏览至少10篇）
+
+  exec command: "agent-browser open https://www.xiaohongshu.com" timeout: 30
+
+搜索目的地+旅行类型关键词，点击并提取至少10篇高互动笔记的完整内容：
+- 景点、餐厅、酒店名称
+- 价格、营业时间、实用提示
+- 个人经验和避坑信息
+
+⚠️ 未满10篇禁止进入下一步。
+
+---
+
+#### 第三步：Google Maps 整合（每个地点必须执行）
+
+对提取到的每个景点/餐厅，依次在 Google Maps 搜索：
+
+  exec command: "agent-browser open https://www.google.com/maps" timeout: 30
+
+每个地点必须获取：
+- ✅ Google Maps 直链
+- ✅ 评分 + 评论数
+- ✅ 完整地址
+- ✅ 营业时间
+- ✅ 💳 支付方式（刷卡/现金/电子支付）
+- ✅ 📸 地点截图：exec command: "agent-browser screenshot ~/.openclaw/workspace/data/maps/{地点名}.png"
+
+找不到时：尝试中英文混搜 → 仍找不到则在文档中标注"⚠️ 建议现场核实"。
+
+---
+
+#### 第四步：生成路线图截图（必需）
+
+在 Google Maps 规划完整路线，按地理位置聚类排序，避免走回头路：
+
+  exec command: "agent-browser open https://www.google.com/maps/dir/" timeout: 30
+  exec command: "agent-browser screenshot ~/.openclaw/workspace/data/routes/complete-route.png"
+
+---
+
+#### 第五步：编译 Markdown 行程
+
+格式模板：
+
+```
+# {目的地} {天数}日行程
+
+## 📋 行程概览
+- 目的地 / 天数 / 类型 / 预算
+
+## 🗓️ 每日行程
+
+### 第N天
+#### 上午/下午/晚上
+**景点/餐厅名称**
+- 📍 [Google Maps]({link})
+- 📍 地址：{address}
+- ⭐ {rating}/5（{count}条评论）
+- 💳 支付方式：{payment}
+- 🎫 门票：{price}
+- 📸 ![地点图](./maps/{name}.png)
+- 💡 {小红书推荐内容}
+
+## 🗺️ 完整路线图
+![路线图](./routes/complete-route.png)
+
+## 💰 预算明细
+## 📌 实用提示
+## 📚 参考资料
+```
+
+---
+
+#### 第六步：保存到飞书（必需，不可跳过）
+
+  使用 docx_builtin_import 工具，file_name 不超过27字符
+
+确认保存后告知用户文档位置。
+
+---
+
+#### 质量检查清单（完成前逐项确认）
+
+- ✅ 浏览了至少10篇小红书笔记
+- ✅ 每个景点有 Google Maps 链接
+- ✅ 每个景点有评分和评论数
+- ✅ 每个景点有完整地址
+- ✅ 每个餐厅/景点标注了支付方式
+- ✅ 每个景点有地点图片截图
+- ✅ 有完整路线图截图
+- ✅ 路线按地理位置优化
+- ✅ 文档已保存到飞书
